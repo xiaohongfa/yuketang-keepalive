@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         雨课堂 播放保活 v3（真播·进度会涨）
 // @namespace    local.ykt.keepalive
-// @version      3.1
-// @description  1x 真实播放；防切后台暂停；防计时器节流；播完自动连播（接口算下一节）；内置心跳诊断
+// @version      3.2
+// @description  1x 真实播放；防切后台暂停；防计时器节流；播完自动连播；内置心跳诊断
 // @author       local
 // @match        *://*.yuketang.cn/*
 // @match        *://*.gdufemooc.cn/*
@@ -231,6 +231,30 @@
   const origOpen = XMLHttpRequest.prototype.open;
   const origSend = XMLHttpRequest.prototype.send;
 
+  // 供 fetch 分支调用（函数声明提升，保证前面能用）
+  function hookResponseClone(res) {
+    try {
+      res.clone().text().then(hookResponseText).catch(() => { });
+    } catch (_) { }
+  }
+
+  /* sign 不在 URL 也不在响应里（实测确认），它是页面自己算出来的。
+     唯一可靠来源：从页面自己发出的请求 URL 里抄。
+     只要页面请求过一次 chapter/schedule，我们就能拿到正确的 sign。 */
+  const SIGN_KEY_EARLY = 'ykt_ka_sign';
+  function learnSignFromUrl(u) {
+    try {
+      const m = String(u).match(/[?&]sign=([A-Za-z0-9\-_]+)/);
+      if (!m) return;
+      const v = m[1];
+      const old = localStorage.getItem(SIGN_KEY_EARLY);
+      if (old !== v) {
+        localStorage.setItem(SIGN_KEY_EARLY, v);
+        push('已从页面请求学到 sign');
+      }
+    } catch (_) { }
+  }
+
   const noteBeat = (sample) => {
     beatCount++;
     lastBeat = Date.now();
@@ -246,11 +270,22 @@
       const pr = origFetch.apply(this, a);
       try {
         const u = String(a[0] && a[0].url ? a[0].url : a[0]);
+
+        // 先从页面自己的请求里学 sign（sign 不在 URL/响应里，只能这样拿）
+        learnSignFromUrl(u);
+
         if (u.indexOf('/video-log/heartbeat') >= 0 || u.indexOf('/video-log/log/track') >= 0) {
           pr.then((r) => {
             if (r.status >= 400) push('心跳失败 HTTP ' + r.status);
             else noteBeat('via fetch');
           }).catch(() => push('心跳网络错误(fetch)'));
+        }
+        // 顺手捡页面自己的目录 / 进度响应
+        if (u.indexOf('/course/chapter') >= 0 || u.indexOf('/course/schedule') >= 0) {
+          pr.then((r) => {
+            if (r.status >= 400) return;
+            hookResponseClone(r);
+          }).catch(() => { });
         }
       } catch (_) { }
       return pr;
@@ -258,7 +293,10 @@
   }
 
   XMLHttpRequest.prototype.open = function (m, u) {
-    try { this.__yktUrl = String(u); } catch (_) { }
+    try {
+      this.__yktUrl = String(u);
+      learnSignFromUrl(u);
+    } catch (_) { }
     return origOpen.apply(this, arguments);
   };
 
@@ -285,6 +323,13 @@
           if (beatEl) beatEl.textContent = String(beatCount);
         });
         this.addEventListener('error', () => push('心跳网络错误'));
+      }
+
+      // 顺手捡页面自己的目录 / 进度响应（XHR 通道）
+      if (u.indexOf('/course/chapter') >= 0 || u.indexOf('/course/schedule') >= 0) {
+        this.addEventListener('load', () => {
+          try { hookResponseText(this.responseText); } catch (_) { }
+        });
       }
     } catch (_) { }
     return origSend.apply(this, arguments);
@@ -352,23 +397,175 @@
         if (hit) { leafNeighbors = hit; return hit; }
       } catch (_) { }
     }
+    // 新版页面是 Vue3，没有 __vue__：改扫页面全局对象里带 nextLeaf 的
+    try {
+      const probes = ['__INITIAL_STATE__', '__NUXT__', '__APP_DATA__', 'g_store', 'app', 'vm', '__vm'];
+      for (const k of probes) {
+        const o = window[k];
+        if (!o || typeof o !== 'object') continue;
+        const found = deepFindLeaf(o, 0);
+        if (found) { leafNeighbors = found; return found; }
+      }
+    } catch (_) { }
     return null;
   };
 
-  // ② 接口算下一节
-  const fetchChapter = async () => {
-    if (!CLASSROOM) return null;
-    // sign 在页面里，从已发出的请求或地址里取
-    const m = location.href.match(/[?&]sign=([^&]+)/);
-    const sign = m ? m[1] : '';
-    const url = `/mooc-api/v1/lms/learn/course/chapter?cid=${CLASSROOM}&classroom_id=${CLASSROOM}` +
-      (sign ? `&sign=${sign}` : '') + '&show_unpublished=false&query=&leaf_type=';
-    try {
-      const r = await fetch(url, { credentials: 'include' });
-      const j = await r.json();
-      return j && j.data ? j.data : null;
-    } catch (e) { push('取目录失败: ' + e.message); return null; }
+  // 在对象图里有限深度搜 nextLeaf / preLeaf
+  const deepFindLeaf = (obj, depth) => {
+    if (!obj || typeof obj !== 'object' || depth > 4) return null;
+    if (obj.nextLeaf || obj.preLeaf) {
+      return { next: obj.nextLeaf, pre: obj.preLeaf, list: obj.courseData };
+    }
+    const keys = Object.keys(obj).slice(0, 60);
+    for (const k of keys) {
+      if (k === '__proto__' || k === 'parent' || k === 'root') continue;
+      let v;
+      try { v = obj[k]; } catch (_) { continue; }
+      if (!v || typeof v !== 'object') continue;
+      const r = deepFindLeaf(v, depth + 1);
+      if (r) return r;
+    }
+    return null;
   };
+
+  /* ── 被动抓包：页面自己请求目录时，把响应缓存下来 ──
+     站点请求目录时自带正确的 sign 与鉴权头，我们只"搭便车"读响应，
+     比自己去拼请求可靠得多（实测自拼 sign 会返回残缺数据，导致找不到当前节）。 */
+
+  const CACHE_KEY = 'ykt_ka_chapter_cache';
+  let chapterCache = null;      // { at, data }
+  let scheduleCache = null;     // { at, map }
+
+  const loadCache = () => {
+    try {
+      const o = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null');
+      if (o && o.data && Array.isArray(o.data.course_chapter)) {
+        chapterCache = o;
+        push(`已载入上次缓存的目录（${o.data.course_chapter.length} 章）`);
+      }
+    } catch (_) { }
+  };
+  const saveCache = () => {
+    try {
+      if (chapterCache) localStorage.setItem(CACHE_KEY, JSON.stringify(chapterCache));
+    } catch (_) { }
+  };
+
+  // 启动时先把上次的目录读进来（跨页跳转后立即可用）
+  loadCache();
+
+  // 从任意 JSON 里尝试提取目录结构
+  const tryExtractChapter = (j) => {
+    if (!j) return null;
+    const d = j.data || j;
+    if (d && Array.isArray(d.course_chapter)) return d;
+    return null;
+  };
+
+  const tryExtractSchedule = (j) => {
+    if (!j) return null;
+    const d = j.data || j;
+    if (d && d.leaf_schedules && typeof d.leaf_schedules === 'object') return d.leaf_schedules;
+    return null;
+  };
+
+  // 只读观察：从页面自身的请求响应里捡数据
+  const origJsonParse = JSON.parse;
+  const hookResponseText = (txt) => {
+    if (!txt || txt.length < 200) return;
+    if (txt.indexOf('course_chapter') < 0 && txt.indexOf('leaf_schedules') < 0) return;
+    let j;
+    try { j = origJsonParse(txt); } catch (_) { return; }
+
+    const ch = tryExtractChapter(j);
+    if (ch && !chapterCache) {
+      chapterCache = { at: Date.now(), data: ch };
+      saveCache();
+      push(`已抓到页面目录（${ch.course_chapter.length} 章）`);
+    }
+    const sc = tryExtractSchedule(j);
+    if (sc) {
+      scheduleCache = { at: Date.now(), map: sc };
+    }
+  };
+
+  /* ── sign 来源：地址栏 → localStorage → cookie → 页面全局变量 ──
+     sign 必须持久化：跳转到下一页后地址栏通常不再带 sign，
+     但目录/进度接口仍需它，否则服务端返回被裁剪的目录。 */
+  const SIGN_KEY = 'ykt_ka_sign';
+
+  const getSign = () => {
+    // ① 从页面自己的请求里学到的（最可靠）
+    try {
+      const learned = localStorage.getItem(SIGN_KEY);
+      if (learned) return learned;
+    } catch (_) { }
+    // ② 地址栏
+    const m = location.href.match(/[?&]sign=([^&]+)/);
+    if (m) {
+      const v = decodeURIComponent(m[1]);
+      try { localStorage.setItem(SIGN_KEY, v); } catch (_) { }
+      return v;
+    }
+    // ③ cookie
+    const cm = document.cookie.match(/(?:^|;\s*)sign=([^;]+)/);
+    if (cm) return decodeURIComponent(cm[1]);
+    // ④ 页面全局
+    try {
+      if (window.__sign) return String(window.__sign);
+    } catch (_) { }
+    return '';
+  };
+
+  /* ── 主动获取目录：多组参数轮试，任一成功即用 ──
+     实测：只带 cid+classroom_id 时会返回残缺目录（找不到当前节），
+     补上 sign 才完整。因此这里把 sign 放到最前，并保留无 sign 兜底。 */
+  let lastChapterFailAt = 0;
+
+  const fetchChapter = async () => {
+    // 1) 优先用抓到的缓存（页面自己请求过就已经有了）
+    if (chapterCache && chapterCache.data) return chapterCache.data;
+
+    if (!CLASSROOM) return null;
+    // 失败后冷却 15 秒再试，避免刷屏，同时给页面留出自己请求目录的机会
+    if (lastChapterFailAt && Date.now() - lastChapterFailAt < 15000) return null;
+
+    const sign = getSign();
+    const cid = CLASSROOM;
+    const candidates = [];
+    if (sign) {
+      candidates.push(`/mooc-api/v1/lms/learn/course/chapter?cid=${cid}&classroom_id=${cid}&sign=${encodeURIComponent(sign)}&show_unpublished=false&query=&leaf_type=`);
+      candidates.push(`/mooc-api/v1/lms/learn/course/chapter?cid=${cid}&sign=${encodeURIComponent(sign)}&classroom_id=${cid}&show_unpublished=false`);
+    }
+    candidates.push(`/mooc-api/v1/lms/learn/course/chapter?cid=${cid}&classroom_id=${cid}&show_unpublished=false&query=&leaf_type=`);
+
+    for (const url of candidates) {
+      try {
+        const r = await fetch(url, { credentials: 'include' });
+        if (r.status >= 400) continue;
+        const j = await r.json();
+        const d = tryExtractChapter(j);
+        if (d && d.course_chapter && d.course_chapter.length) {
+          // 校验：必须能定位到当前节，否则视为残缺数据
+          const flat = flatten(d);
+          if (flat.length && flat.some((x) => x.id === String(CUR_LEAF))) {
+            chapterCache = { at: Date.now(), data: d };
+            saveCache();
+            push(`目录已获取（${flat.length} 个单元，sign=${sign ? '有' : '无'}）`);
+            return d;
+          }
+          push(`目录数据不完整（${flat.length} 个单元，缺当前节），换参数重试`);
+        } else {
+          push('目录接口未返回 course_chapter');
+        }
+      } catch (e) {
+        push('取目录异常: ' + (e.message || e));
+      }
+    }
+    lastChapterFailAt = Date.now();
+    return null;
+  };
+
 
   const flatten = (data) => {
     const out = [];
@@ -395,13 +592,19 @@
   // 进度：接口返回 leaf_schedules（0~1）
   const fetchSchedules = async () => {
     if (!CLASSROOM) return {};
-    const m = location.href.match(/[?&]sign=([^&]+)/);
-    const sign = m ? m[1] : '';
+    // 优先用抓到的进度（页面自己请求过就有）
+    if (scheduleCache && Date.now() - scheduleCache.at < 120000) {
+      return scheduleCache.map;
+    }
+    const sign = getSign();
     try {
       const r = await fetch(`/mooc-api/v1/lms/learn/course/schedule?cid=${CLASSROOM}` +
-        (sign ? `&sign=${sign}` : '') + `&classroom_id=${CLASSROOM}`, { credentials: 'include' });
+        (sign ? `&sign=${encodeURIComponent(sign)}` : '') + `&classroom_id=${CLASSROOM}`,
+        { credentials: 'include' });
       const j = await r.json();
-      return (j && j.data && j.data.leaf_schedules) || {};
+      const sc = tryExtractSchedule(j);
+      if (sc) { scheduleCache = { at: Date.now(), map: sc }; return sc; }
+      return {};
     } catch (_) { return {}; }
   };
 
@@ -415,7 +618,11 @@
   const buildUrl = (leaf) => {
     const base = pageBase();
     const node = leaf.sectionId || 0;
-    return `${base}/ai-workspace/lms-graph/${CLASSROOM}/video/${leaf.id}?is_chapter=1&node_id=${node}`;
+    let u = `${base}/ai-workspace/lms-graph/${CLASSROOM}/video/${leaf.id}?is_chapter=1&node_id=${node}`;
+    // sign 必须跟着传下去，否则下一页的目录/进度接口会被服务端裁剪
+    const sign = getSign();
+    if (sign) u += `&sign=${encodeURIComponent(sign)}`;
+    return u;
   };
 
   // ③ DOM 兜底
@@ -449,6 +656,22 @@
   };
 
   let advancing = false;
+
+  /* 进页面就预取目录：播完再取往往已经晚了（页面可能已卸载/参数失效）。
+     失败也留缓存，下次跳转仍可用。 */
+  const prefetchChapter = async () => {
+    if (chapterCache) return;
+    const d = await fetchChapter();
+    if (!d) {
+      // 主动补一刀：直接请求课程目录页，让站点自己去拉目录，我们捡响应
+      push('预取目录失败，尝试通过目录页触发');
+      try {
+        const base = pageBase();
+        const url = `${base}/ai-workspace/lms-graph/${CLASSROOM}`;
+        fetch(url, { credentials: 'include' }).catch(() => { });
+      } catch (_) { }
+    }
+  };
 
   const nextLeaf = async () => {
     if (advancing) return;
@@ -540,6 +763,24 @@
         if (!t) { push('🎉 目录内已全部完成'); setSt('全部完成'); stop(); return; }
         push('点目录进入：' + t.title);
         humanClick(t.n);
+        return;
+      }
+
+      // ④ 最后兜底：只有播放器的 nextLeaf，没有目录也能拼 URL（node_id 用当前节的）
+      if (playerNextId) {
+        if (visited.has(playerNextId)) {
+          push(`播放器给的下一节 ${playerNextId} 已试过，停止避免循环`);
+          setSt('需人工介入');
+          stop();
+          return;
+        }
+        const curNode = (location.href.match(/[?&]node_id=(\d+)/) || [])[1] || 0;
+        let u = `${pageBase()}/ai-workspace/lms-graph/${CLASSROOM}/video/${playerNextId}?is_chapter=1&node_id=${curNode}`;
+        const sg = getSign();
+        if (sg) u += `&sign=${encodeURIComponent(sg)}`;
+        push('目录不可用，改按播放器 nextLeaf 跳转：' + playerNextId);
+        push('跳转 ' + u.replace(location.origin, ''));
+        setTimeout(() => { location.href = u; }, 600);
         return;
       }
 
@@ -668,6 +909,12 @@
     buildPanel();
     push('就绪：点「开始」，或直接打开视频页');
     setInterval(tick, 1500);
+
+    // 进播放页就预取目录，别等播完再取
+    if (CUR_LEAF && CLASSROOM) {
+      setTimeout(() => { prefetchChapter(); }, 2500);
+      setTimeout(() => { prefetchChapter(); }, 12000);
+    }
 
     // 自动启动：不依赖 URL 猜测，只看「页面上是否真的出现播放器」。
     // 这样 lms / ai-workspace / iframe 内嵌播放器都能覆盖。
