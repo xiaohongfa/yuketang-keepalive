@@ -41,6 +41,25 @@ s.timeNoUpdateNum <= 10 ? (正常发送) : $video.trigger('playBtn.toggle', { xt
 
 另外，**倍速会被折算**：心跳里带 `sp` 字段，2 倍速下记录的有效时长只有一半。
 
+### 3. 播完不会自动下一节
+
+新版播放页（`/ai-workspace/lms-graph/{classroom}/video/{leaf}`）里**没有目录树**，页面上不存在 `.leaf-detail`。任何依赖「当前页 DOM 里找目录项」的连播方案都会在这一页失效。
+
+正确的跳转地址是构造出来的：
+
+```
+{base}/ai-workspace/lms-graph/{classroom_id}/video/{leaf_id}?is_chapter=1&node_id={section_id}
+```
+
+其中 `node_id` 就是该单元的 `section_id`（已用实际 URL 比对确认）。`section_id` 需要从目录接口取：
+
+```
+GET /mooc-api/v1/lms/learn/course/chapter?cid={classroom_id}&classroom_id={classroom_id}&sign={sign}&show_unpublished=false
+GET /mooc-api/v1/lms/learn/course/schedule?cid={classroom_id}&sign={sign}&classroom_id={classroom_id}
+```
+
+后者返回 `leaf_schedules`，值是 0~1 的完成度。判定「已完成」要认 `>= 1`，页面上的表现是文本变成「已完成」。
+
 ---
 
 ## 修复原理
@@ -52,9 +71,13 @@ s.timeNoUpdateNum <= 10 ? (正常发送) : $video.trigger('playBtn.toggle', { xt
 | 后台计时器被节流 | 用 Web Worker 计时器保活（后台标签页的 `setInterval` 会被限流到 1 次/分钟） |
 | 倍速折算 | 锁定 1x；若检测到其他脚本抢倍速则自动退让，避免打架 |
 | 自动播放 | 页面上出现 `<video>` 即接管，不依赖 URL 猜测 |
-| 自动下一节 | 按真实 DOM 结构定位目录项，播完进入下一个未完成单元 |
+| 播完检测 | `ended` + `timeupdate` 双保险（部分播放器在跳转后 `ended` 不触发） |
+| 自动下一节 | ①读播放器 `nextLeaf` → ②调目录接口算 `section_id` 并构造 URL → ③DOM 兜底 |
+| 防原地循环 | 记录已访问节点；若目标进度未涨则跳过它继续往后，不会把同一节重播 |
 
 事件拦截只在页面存在播放器时生效，不影响登录页与验证码。
+
+跳转前会等待约 8 秒，让心跳把 `cp=duration` 上报完。否则刚看完的这一节在服务端仍是未完成，会把自己又选成「下一节」。
 
 ---
 
@@ -68,9 +91,9 @@ s.timeNoUpdateNum <= 10 ? (正常发送) : $video.trigger('playBtn.toggle', { xt
 
 ## 使用
 
-- **自动**：进入视频页后面板自动启动。
-- **手动**：点面板上的「开始」。
-- **自动下一节**：在**课程目录页**点「开始」，脚本会依次进入未完成的单元。
+- **自动**：进入视频页后自动启动。
+- **自动连播**：播完等 8 秒后自动进入下一个未完成单元，可无人值守。
+- **手动跳过**：面板日志会显示「跳过 X（进度未更新）」。
 
 面板折叠后只留标题栏；日志区会显示心跳次数、倍速纠偏、暂停续播等动作。
 
@@ -99,24 +122,27 @@ localStorage.setItem('ykt_playback_rate', '1')
 
 ## 安全性
 
-脚本本身不含任何网络请求代码：
+脚本不连任何第三方：
 
-- 无 `http://` / `https://` / IP 字面量
+- 无 `http://` / `https://` / IP 字面量 —— 所有请求都用相对路径，只打当前站点
 - 无第三方域名、无 `@connect`、`@grant none`
 - 无 `eval` / `new Function` / 动态插入 script
 - 不读取 `document.cookie`
 
-它对 `fetch` 与 `XMLHttpRequest` 只做**只读观察**（读取 URL 判断是否为心跳、统计次数），不改写请求内容与响应。
+对 `fetch` 与 `XMLHttpRequest` 只做**只读观察**（读取 URL 判断是否为心跳、统计次数），不改写请求内容与响应。
 
-实测对照：同一页面在安装与不安装脚本两种情况下，真实网络请求数、目标主机、路径完全一致。
+唯一主动发起的请求，是读取课程目录与进度（`/mooc-api/v1/lms/learn/course/chapter`、`/schedule`）。这两个是站点自己的只读 GET 接口，同源、带 `credentials: 'include'` 复用你自己的登录态，不向任何第三方发送数据。
+
+实测对照：同一页面在安装与不安装两种情况下，真实网络请求数、目标主机、路径完全一致（仅在需要连播时才额外请求目录接口）。
 
 ---
 
 ## 已知限制
 
-- 自动下一节的目录选择器依赖站点模板的 DOM 结构（`.leaf-detail` + `.icon--shipin` + `.study-progress`）。站点改版后可能需要调整。
+- 连播依赖站点的目录接口结构（`course_chapter[].section_leaf_list[].leaf_list[]`）。站点改版后可能需要调整。
+- 若某一节的进度始终不涨（比如该单元不计分），脚本会跳过它继续往后，不会卡死；跳过记录存在 `localStorage` 的 `ykt_ka_visited`。
 - 播放器位于跨域 iframe 时，依赖用户脚本在子帧内也注入（Tampermonkey 默认行为）。
-- 仅对「视频 / 音频」类型单元生效，跳过直播与图文。
+- 仅对「视频 / 音频」类型单元生效（`leaf_type` 0/1），跳过直播与图文。
 
 ## License
 

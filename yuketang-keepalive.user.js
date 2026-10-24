@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         雨课堂 播放保活 v3（真播·进度会涨）
 // @namespace    local.ykt.keepalive
-// @version      3.0
-// @description  1x 真实播放；防切后台暂停；防计时器节流；播完自动下一节；内置心跳诊断
+// @version      3.1
+// @description  1x 真实播放；防切后台暂停；防计时器节流；播完自动连播（接口算下一节）；内置心跳诊断
 // @author       local
 // @match        *://*.yuketang.cn/*
 // @match        *://*.gdufemooc.cn/*
@@ -21,6 +21,22 @@
   let running = false;
   let userPauseAt = 0;
   let beatCount = 0, lastBeat = 0, lastBeatStatus = '';
+
+  /* ── 页面参数（必须在最前面解析，后续模块都要用） ── */
+  const CUR_LEAF = (() => {
+    const m = location.href.match(/\/video\/(\d{5,})/) ||
+      location.href.match(/\/audio\/(\d{5,})/) ||
+      location.href.match(/\/lms\/(\d+)\/graph\/(\d{5,})/);
+    if (!m) return null;
+    return m.length > 2 ? m[2] : m[1];
+  })();
+
+  const CLASSROOM = (() => {
+    const m = location.href.match(/lms-graph(?:-mobile)?\/(\d{5,})/) ||
+      location.href.match(/lms\/(\d{5,})\//) ||
+      location.href.match(/classroom_id=(\d{5,})/);
+    return m ? m[1] : null;
+  })();
 
   const push = (m) => {
     const line = `[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${m}`;
@@ -112,21 +128,15 @@
       null;
   };
 
-  // 顶层帧汇总：统计所有同源子帧里是否有播放器，用于判断"是否在播放页"
-  const anyFrameHasVideo = () => {
-    if (pickVideo()) return true;
-    for (const f of [...document.querySelectorAll('iframe')]) {
-      try {
-        if (f.contentDocument && f.contentDocument.querySelector('video')) return true;
-      } catch (_) { /* 跨域，忽略：该帧会自己加载脚本 */ }
-    }
-    return false;
-  };
-
   let hooked = null;
+  const hookedSet = new WeakSet();
 
   const hook = (v) => {
-    if (!v || hooked === v) return;
+    if (!v) return;
+    // 用 WeakSet 判重：SPA 路由切换会换掉 <video> 元素，
+    // 只比较单例引用会在"同一对象被复用"时漏挂，导致 ended 不触发。
+    if (hookedSet.has(v)) return;
+    hookedSet.add(v);
     hooked = v;
 
     // 关键：站点 sendEvents 里 timeNoUpdateNum > 10 会强制暂停播放器，
@@ -171,10 +181,32 @@
     toastUp(v);
 
     v.addEventListener('play', () => push('播放中 ×' + v.playbackRate));
-    v.addEventListener('ended', () => {
-      push('本节播完');
-      if (running) setTimeout(nextLeaf, 1500);
+
+    // 播完检测：ended 在某些播放器/跳转场景下不触发，用 timeupdate 兜底。
+    // 双保险，且用 finishFired 防止重复跳转。
+    let finishFired = false;
+    const onFinish = (from) => {
+      if (finishFired) return;
+      finishFired = true;
+      push('本节播完（' + from + '）');
+      if (!running) return;
+      // 播完时进度还没同步到服务端：等心跳把 cp=d 上报完再走，
+      // 否则下一节取进度时会把刚看完这节又算成未完成，导致回头重播。
+      push('等待进度同步（约 8 秒）…');
+      setTimeout(() => { finishFired = false; nextLeaf(); }, 8000);
+    };
+
+    v.addEventListener('ended', () => onFinish('ended'));
+    v.addEventListener('timeupdate', () => {
+      const d = v.duration || 0;
+      if (d > 1 && v.currentTime >= d - 0.35 && !v.paused) onFinish('timeupdate');
     });
+    // 站点把播放器暂停在末尾也算看完
+    v.addEventListener('pause', () => {
+      const d = v.duration || 0;
+      if (d > 1 && v.currentTime >= d - 1.2) onFinish('pause-at-end');
+    });
+
     v.addEventListener('error', () => push('播放器报错 code=' + (v.error && v.error.code)));
 
     push(`已挂钩播放器，时长 ${Math.round(v.duration || 0)}s`);
@@ -258,40 +290,148 @@
     return origSend.apply(this, arguments);
   };
 
-  /* ═══════════ 5. 自动下一节（按真实 DOM 结构） ═══════════
-     真实结构（bundle 实证）：
-       .leaf-detail[.is-actived]   → 目录项，click 触发 goDetail
-         <i class="iconfont icon--shipin">   leaf_type 0 = 视频
-         <i class="iconfont icon--yinpin">   leaf_type 1 = 音频
-         <i class="iconfont icon--zhibo">    leaf_type 2 = 直播
-         <i class="iconfont icon--tuwen">    leaf_type 3 = 图文
-         <study-progress class="fr">        进度组件
-            schedule >= 1  → "已完成"
-            schedule <  1  → "N%"（Math.round(100*schedule)）
+  /* ═══════════ 位图：记录已进入的节点，防重复触发 ═══════════ */
+  const VISITED_KEY = 'ykt_ka_visited';
+  const loadVisited = () => {
+    try { return new Set(JSON.parse(localStorage.getItem(VISITED_KEY) || '[]')); }
+    catch (_) { return new Set(); }
+  };
+  const saveVisited = (set) => {
+    try { localStorage.setItem(VISITED_KEY, JSON.stringify([...set].slice(-300))); } catch (_) { }
+  };
+  const visited = loadVisited();
+  if (CUR_LEAF) { visited.add(String(CUR_LEAF)); saveVisited(visited); }
 
-     判定完成只认两种：文本 "已完成"，或百分比 >= 100。           */
+  /* ═══════════ 5. 自动下一节（接口优先，DOM 兜底） ═══════════
+     实测教训：新版 ai-workspace 播放页里没有 .leaf-detail 目录树，
+     纯 DOM 方案在播放页必然失败（日志：「当前页没有目录」）。
+     因此改为三条路依次尝试：
 
+     ① 抓播放器配置：播放器初始化时会收到 preLeaf / nextLeaf（站点源码实证），
+        这两个对象里有下一节 id，最接近站点自己的行为。
+     ② 调接口算：/mooc-api/v1/lms/learn/course/chapter 返回完整目录，
+        按 leaf id 定位后取下一个未完成视频，直接构造播放页 URL 跳转。
+     ③ DOM 兜底：仅在目录页可用时使用。
+
+     跳转 URL 规则（由用户实际 URL 验证）：
+        {base}/ai-workspace/lms-graph/{classroom_id}/video/{leaf_id}?is_chapter=1&node_id={section_id}
+     base 从当前地址推断，不写死。                                        */
+
+  // 页面 origin 前缀（保留 /ai-workspace 这类 base）
+  const pageBase = () => {
+    const p = location.pathname;
+    const i = p.indexOf('/ai-workspace');
+    if (i >= 0) return location.origin + p.slice(0, i);
+    return location.origin;
+  };
+
+  // ① 播放器配置里的 preLeaf / nextLeaf
+  let leafNeighbors = null;
+
+  const scanPlayerConfig = () => {
+    if (leafNeighbors) return leafNeighbors;
+    // 从 Vue 组件实例里找（站点用 Vue2，__vue__ 指向组件）
+    const roots = [document.querySelector('#app'), document.body];
+    const seen = new Set();
+    const walk = (node, depth) => {
+      if (!node || depth > 6) return null;
+      if (seen.has(node)) return null;
+      seen.add(node);
+      const cfg = node.$options && node.$options.propsData;
+      const data = node._data || cfg;
+      if (data && (data.nextLeaf || data.preLeaf)) {
+        return { next: data.nextLeaf, pre: data.preLeaf, list: data.courseData };
+      }
+      const kids = node.$children || [];
+      for (const k of kids) { const r = walk(k, depth + 1); if (r) return r; }
+      return null;
+    };
+    for (const r of roots) {
+      try {
+        const hit = walk(r && r.__vue__ ? r.__vue__ : null, 0);
+        if (hit) { leafNeighbors = hit; return hit; }
+      } catch (_) { }
+    }
+    return null;
+  };
+
+  // ② 接口算下一节
+  const fetchChapter = async () => {
+    if (!CLASSROOM) return null;
+    // sign 在页面里，从已发出的请求或地址里取
+    const m = location.href.match(/[?&]sign=([^&]+)/);
+    const sign = m ? m[1] : '';
+    const url = `/mooc-api/v1/lms/learn/course/chapter?cid=${CLASSROOM}&classroom_id=${CLASSROOM}` +
+      (sign ? `&sign=${sign}` : '') + '&show_unpublished=false&query=&leaf_type=';
+    try {
+      const r = await fetch(url, { credentials: 'include' });
+      const j = await r.json();
+      return j && j.data ? j.data : null;
+    } catch (e) { push('取目录失败: ' + e.message); return null; }
+  };
+
+  const flatten = (data) => {
+    const out = [];
+    const chapters = (data && data.course_chapter) || [];
+    for (const c of chapters) {
+      const secs = c.section_leaf_list || [];
+      for (const s of secs) {
+        const leaves = s.leaf_list || [s];
+        for (const l of leaves) {
+          if (!l || l.is_locked) continue;
+          out.push({
+            id: String(l.id),
+            name: l.name || '',
+            type: l.leaf_type,
+            sectionId: l.section_id || s.section_id || s.id,
+            chapterId: l.chapter_id || c.chapter_id || c.id,
+          });
+        }
+      }
+    }
+    return out;
+  };
+
+  // 进度：接口返回 leaf_schedules（0~1）
+  const fetchSchedules = async () => {
+    if (!CLASSROOM) return {};
+    const m = location.href.match(/[?&]sign=([^&]+)/);
+    const sign = m ? m[1] : '';
+    try {
+      const r = await fetch(`/mooc-api/v1/lms/learn/course/schedule?cid=${CLASSROOM}` +
+        (sign ? `&sign=${sign}` : '') + `&classroom_id=${CLASSROOM}`, { credentials: 'include' });
+      const j = await r.json();
+      return (j && j.data && j.data.leaf_schedules) || {};
+    } catch (_) { return {}; }
+  };
+
+  const leafDoneById = (sched, id) => {
+    const v = sched[String(id)];
+    if (v === undefined || v === null) return false;
+    const n = typeof v === 'object' ? (v.done / (v.total || 1)) : Number(v);
+    return n >= 1;
+  };
+
+  const buildUrl = (leaf) => {
+    const base = pageBase();
+    const node = leaf.sectionId || 0;
+    return `${base}/ai-workspace/lms-graph/${CLASSROOM}/video/${leaf.id}?is_chapter=1&node_id=${node}`;
+  };
+
+  // ③ DOM 兜底
   const LEAF_SEL = '.leaf-detail';
-
   const leafIsPlayable = (n) =>
     !!n.querySelector('.icon--shipin, .icon--yinpin') &&
     !n.querySelector('.icon--zhibo, .icon--tuwen');
-
-  const leafDone = (n) => {
+  const leafDoneDom = (n) => {
     const t = (n.textContent || '');
     if (/已完成/.test(t)) return true;
     const m = t.match(/(\d{1,3})\s*%/);
-    if (m) return Number(m[1]) >= 100;
-    return false;
+    return m ? Number(m[1]) >= 100 : false;
   };
-
-  const collect = () => [...document.querySelectorAll(LEAF_SEL)]
+  const collectDom = () => [...document.querySelectorAll(LEAF_SEL)]
     .filter(leafIsPlayable)
-    .map((n) => ({
-      n,
-      done: leafDone(n),
-      title: (n.querySelector('.title')?.textContent || n.textContent || '').trim().slice(0, 46),
-    }));
+    .map((n) => ({ n, done: leafDoneDom(n), title: (n.querySelector('.title')?.textContent || '').trim() }));
 
   const humanClick = (node) => {
     const r = node.getBoundingClientRect();
@@ -308,28 +448,110 @@
     fire('click', x, y);
   };
 
-  const nextLeaf = () => {
-    const list = collect();
-    if (!list.length) {
-      push('当前页没有目录，切换到课程目录页后会自动继续');
-      return;
+  let advancing = false;
+
+  const nextLeaf = async () => {
+    if (advancing) return;
+    advancing = true;
+    try {
+      // ① 播放器组件里的 nextLeaf（站点自己算的，最接近原生行为）
+      const nb = scanPlayerConfig();
+      let playerNextId = null;
+      if (nb && nb.next && nb.next.id) {
+        playerNextId = String(nb.next.id);
+        push('播放器给出的下一节：' + (nb.next.name || playerNextId));
+      }
+
+      // ② 接口算（能同时拿到 section_id，用来拼 URL）
+      if (CLASSROOM) {
+        const data = await fetchChapter();
+        if (data) {
+          const list = flatten(data);
+          const sched = await fetchSchedules();
+          const curIdx = list.findIndex((x) => x.id === String(CUR_LEAF));
+          if (curIdx < 0) {
+            push(`接口目录里没找到当前节 ${CUR_LEAF}，改用 DOM`);
+          } else {
+            // 优先：紧跟其后的未完成可播放单元
+            let target = null;
+            for (let i = curIdx + 1; i < list.length; i++) {
+              const x = list[i];
+              if (x.type !== 0 && x.type !== 1) continue;      // 只看视频/音频
+              if (leafDoneById(sched, x.id)) continue;
+              target = x; break;
+            }
+            // 播放器已给出下一节时，以播放器的判断为准（它只按顺序取，不管进度）
+            if (playerNextId) {
+              const byPlayer = list.find((x) => x.id === playerNextId);
+              if (byPlayer && !leafDoneById(sched, byPlayer.id)) target = byPlayer;
+            }
+            // 后面都完成了 → 回头找全局第一个未完成
+            if (!target) {
+              target = list.find((x) => (x.type === 0 || x.type === 1) && !leafDoneById(sched, x.id)) || null;
+            }
+            if (target) {
+              const remain = list.filter((x) =>
+                (x.type === 0 || x.type === 1) && !leafDoneById(sched, x.id)).length;
+
+              // 关键防护：目标若是"当前这一节"或"已去过且仍未完成"的，说明服务端进度没涨。
+              // 此时直接跳到当前节会把同一节重播，形成无限循环——必须往后推进。
+              const isStuck = String(target.id) === String(CUR_LEAF) ||
+                visited.has(String(target.id));
+
+              if (isStuck) {
+                push(`「${target.name}」进度未更新（可能不计分），跳过它继续往后找`);
+                visited.add(String(target.id));
+                saveVisited(visited);
+                const skips = visited.size;
+                const after = list.find((x) =>
+                  (x.type === 0 || x.type === 1) &&
+                  !leafDoneById(sched, x.id) &&
+                  !visited.has(String(x.id)));
+                if (after) {
+                  target = after;
+                  push(`改去：${after.name}`);
+                } else {
+                  push(`已跳过 ${skips} 个不涨进度的单元，没有更多可播的了`);
+                  push('可能这些单元不计分，或需要手动完成。已停止。');
+                  setSt('需人工介入');
+                  stop();
+                  return;
+                }
+              }
+
+              const url = buildUrl(target);
+              push(`进入下一节（剩 ${remain}）：${target.name}`);
+              push('跳转 ' + url.replace(location.origin, ''));
+              setTimeout(() => { location.href = url; }, 600);
+              return;
+            }
+            push('🎉 所有视频/音频单元都已完成');
+            setSt('全部完成');
+            stop();
+            return;
+          }
+        }
+      }
+
+      // ③ DOM 兜底
+      const dom = collectDom();
+      if (dom.length) {
+        const t = dom.find((x) => !x.done);
+        if (!t) { push('🎉 目录内已全部完成'); setSt('全部完成'); stop(); return; }
+        push('点目录进入：' + t.title);
+        humanClick(t.n);
+        return;
+      }
+
+      // 全都拿不到，给可执行的提示
+      push('无法确定下一节：没抓到目录接口，且当前页没有目录树');
+      push('请手动回到课程目录页点一次「开始」，之后会自动串联');
+      setSt('需要目录页');
+    } catch (e) {
+      push('下一节出错：' + (e.message || e));
+    } finally {
+      advancing = false;
     }
-    const idx = list.findIndex((x) => !x.done);
-    if (idx < 0) {
-      push('🎉 目录内可播放单元全部完成');
-      setSt('全部完成');
-      return;
-    }
-    const target = list[idx];
-    const remain = list.filter((x) => !x.done).length;
-    push(`进入下一节（剩 ${remain}）：${target.title}`);
-    const before = location.href;
-    humanClick(target.n);
-    // SPA 路由未必变 href（可能只是内部状态），所以再点一次兜底
-    setTimeout(() => {
-      if (!running) return;
-      if (!pickVideo() && location.href === before) humanClick(target.n);
-    }, 2200);
   };
 
   /* ═══════════ 6. 面板 ═══════════ */
